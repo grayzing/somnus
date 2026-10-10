@@ -6,3 +6,6 @@ torch
 rich
 pandas
 numba
+geopandas
+shapely
+osmnx

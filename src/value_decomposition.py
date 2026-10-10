@@ -178,7 +178,7 @@ def take_observation(agent_id: int, simulator: Simulator) -> torch.Tensor:
         [np.stack(
             [
                 simulator.radio_channel_model.received_power_dbm_matrix_per_resource_element[simulator.sector_manager.neighboring_sectors_indices_matrix[agent_id]],
-                simulator.radio_channel_model.sinr_dbm_matrix_per_slot[simulator.sector_manager.neighboring_sectors_indices_matrix[agent_id]]
+                simulator.radio_channel_model.snr_dbm_matrix_per_slot[simulator.sector_manager.neighboring_sectors_indices_matrix[agent_id]]
             ],
             axis=0
             ).flatten(),
