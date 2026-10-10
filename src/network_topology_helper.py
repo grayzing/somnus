@@ -1,4 +1,6 @@
 import numpy as np
+import geopandas as gpd
+import pandas as pd
 
 from base_station_manager import BaseStationManager
 from sector_manager import SectorManager
@@ -124,114 +126,84 @@ class HeterogenousHexagonalNetworkTopologyHelperWithRandomDevicePlacements(Hexag
 
 class VisibilityBasedNetworkTopologyHelper(NetworkTopologyHelper):
     """
-    Implements the BS placement algorithm using a voxel viewshed/visibility approach 
-    for Urban Macro (UMa) environments as described in arXiv:2511.22105v1.
+    BS placement via voxel viewshed/visibility for UMa environments (arXiv:2511.22105v1).
+    Vectorized: single pass of Shapely 2.x predicates instead of per-pair Python calls.
     """
-    def __init__(self, num_base_stations: int, num_sectors_per_base_station: int, num_devices: int, 
-                 candidate_bs_positions: np.ndarray, service_area_grid: np.ndarray, 
-                 geometry_helper: GeometryHelper, seed: int = 24) -> None:
-        super().__init__(num_base_stations=num_base_stations, 
-                         num_sectors_per_base_station=num_sectors_per_base_station, 
+    def __init__(self, num_base_stations, num_sectors_per_base_station, num_devices,
+                 candidate_bs_positions, service_area_grid, geometry_helper, seed=24):
+        super().__init__(num_base_stations=num_base_stations,
+                         num_sectors_per_base_station=num_sectors_per_base_station,
                          num_devices=num_devices)
         self.candidate_bs_positions = candidate_bs_positions
         self.service_area_grid = service_area_grid
         self.geometry_helper = geometry_helper
         self.rng = np.random.default_rng(seed)
 
+    # ------------------------------------------------------------------
+    def _extract_building_candidates(self, obstacles: gpd.GeoDataFrame) -> np.ndarray:
+        """Rooftop candidates: vectorized centroid + height parsing (no iterrows)."""
+        heights = np.full(len(obstacles), 15.0)
+
+        def _parse(col, scale=1.0):
+            s = obstacles[col].astype(str).str.split(';').str[0] \
+                     .str.replace('m', '', regex=False).str.replace(',', '', regex=False)
+            return pd.to_numeric(s, errors='coerce').to_numpy(dtype=np.float32) * scale
+
+        if 'height' in obstacles.columns:
+            h = _parse('height')
+            heights = np.where(np.isfinite(h) & (h > 0), h, heights)
+        elif 'building:levels' in obstacles.columns:
+            lv = _parse('building:levels', scale=3.0)
+            heights = np.where(np.isfinite(lv) & (lv > 0), lv, heights)
+
+        centroids = obstacles.geometry.centroid      # vectorized, no Python loop
+        return np.column_stack([centroids.x, centroids.y, heights]).astype(np.float32)
+
+    # ------------------------------------------------------------------
     def generate_base_station_positions(self):
-        """
-        Extracts building centroids and heights to act as candidate BS positions,
-        then iteratively selects the BS with the maximum visibility (LoS) to uncovered 
-        Service Area (SA) grid points.
-        """
         obstacles = self.geometry_helper.obstacles_gdf
-        
-        # Override initial random candidates with building rooftops if GIS data is present
         if obstacles is not None and not obstacles.empty:
-            building_candidates = []
-            for idx, row in obstacles.iterrows():
-                geom = row.geometry
-                if geom is None:
-                    continue
-                
-                # Determine building height from OSM metadata (fallback to 15.0m)
-                height = 15.0
-                if 'height' in row and row['height']:
-                    try:
-                        height = float(str(row['height']).replace('m', '').replace(',', '').split(';')[0])
-                    except (ValueError, TypeError):
-                        pass
-                elif 'building:levels' in row and row['building:levels']:
-                    try:
-                        height = float(str(row['building:levels']).split(';')[0]) * 3.0
-                    except (ValueError, TypeError):
-                        pass
-                
-                centroid = geom.centroid
-                building_candidates.append([centroid.x, centroid.y, height])
-                
-            if building_candidates:
-                self.candidate_bs_positions = np.array(building_candidates, dtype=np.float32)
+            candidates = self._extract_building_candidates(obstacles)
+            if candidates.size:
+                self.candidate_bs_positions = candidates
 
-        num_candidates = self.candidate_bs_positions.shape[0]
-        num_sa_points = self.service_area_grid.shape[0]
-        
-        # Precompute visibility matrix (Candidates x SA Points)
-        visibility_matrix = np.zeros((num_candidates, num_sa_points), dtype=bool)
-        for c in range(num_candidates):
-            for p in range(num_sa_points):
-                visibility_matrix[c, p] = self.geometry_helper.check_line_of_sight_pairwise(
-                    self.candidate_bs_positions[c], 
-                    self.service_area_grid[p]
-                )
-        
-        selected_bs_indices = []
+        candidates = self.candidate_bs_positions
+        grid = self.service_area_grid
+        num_candidates, num_sa_points = candidates.shape[0], grid.shape[0]
+
+        # One (C, P) boolean LoS matrix — chunked vectorized Shapely, not C*P calls
+        visibility_matrix = self.geometry_helper.line_of_sight_matrix(candidates, grid)
+
+        # Greedy max-coverage selection, vectorized over candidates
+        selected: list[int] = []
+        selected_mask = np.zeros(num_candidates, dtype=bool)
         covered_sa_mask = np.zeros(num_sa_points, dtype=bool)
-        
-        # Greedily select BSs that maximize new visibility
-        while len(selected_bs_indices) < self.num_base_stations:
-            best_candidate = -1
-            max_new_coverage = 0
-            
-            for c in range(num_candidates):
-                if c in selected_bs_indices:
-                    continue
-                
-                # Calculate how many currently uncovered points this candidate can see
-                new_coverage = np.sum(visibility_matrix[c] & ~covered_sa_mask)
-                
-                if new_coverage > max_new_coverage:
-                    max_new_coverage = new_coverage
-                    best_candidate = c
-            
-            # Stop if no further visibility improvement is possible
-            if best_candidate == -1 or max_new_coverage == 0:
+
+        for _ in range(self.num_base_stations):
+            new_coverage = np.count_nonzero(visibility_matrix & ~covered_sa_mask, axis=1)
+            new_coverage[selected_mask] = 0            # exclude already-selected
+            best = int(np.argmax(new_coverage))
+            if new_coverage[best] == 0:                # no further improvement possible
                 break
-                
-            selected_bs_indices.append(best_candidate)
-            covered_sa_mask |= visibility_matrix[best_candidate]
+            selected.append(best)
+            selected_mask[best] = True
+            covered_sa_mask |= visibility_matrix[best]
 
-        # If we couldn't find enough BSs to hit the target, fallback or warn
-        if len(selected_bs_indices) < self.num_base_stations:
-            print(f"Warning: Only {len(selected_bs_indices)} BSs provided visibility improvements. "
+        if len(selected) < self.num_base_stations:
+            print(f"Warning: Only {len(selected)} BSs provided visibility improvements. "
                   f"Target was {self.num_base_stations}.")
-            # Pad with random unselected candidates if strict count is required
-            remaining_candidates = list(set(range(num_candidates)) - set(selected_bs_indices))
-            pad_count = self.num_base_stations - len(selected_bs_indices)
-            selected_bs_indices.extend(self.rng.choice(remaining_candidates, min(pad_count, len(remaining_candidates)), replace=False))
+            remaining = np.nonzero(~selected_mask)[0]
+            pad = min(self.num_base_stations - len(selected), remaining.size)
+            if pad > 0:
+                selected.extend(self.rng.choice(remaining, pad, replace=False).tolist())
 
-        # Assign selected positions to the Base Station Manager
-        self.base_station_manager.base_station_position_matrix = self.candidate_bs_positions[selected_bs_indices[:self.num_base_stations]].astype(np.float32)
+        self.base_station_manager.base_station_position_matrix = \
+            candidates[selected[:self.num_base_stations]].astype(np.float32)
 
     def generate_device_positions(self):
-        """
-        Distributes devices randomly across the valid Service Area (SA) grid points.
-        """
-        num_sa_points = self.service_area_grid.shape[0]
-        selected_indices = self.rng.choice(num_sa_points, self.num_devices, replace=True)
-        device_positions = self.service_area_grid[selected_indices]
-        
-        self.device_manager.device_position_matrix = device_positions.astype(np.float32)
-        
+        selected_indices = self.rng.choice(self.service_area_grid.shape[0],
+                                           self.num_devices, replace=True)
+        self.device_manager.device_position_matrix = \
+            self.service_area_grid[selected_indices].astype(np.float32)
         velocity_multipliers = self.rng.integers(-1, 2, size=(self.num_devices, 3))
         self.device_manager.device_velocity_matrix *= velocity_multipliers
