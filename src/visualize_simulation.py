@@ -123,7 +123,7 @@ def visualize_simulation_plotly_3d():
         fig.add_trace(go.Scatter3d(
             x=link_x, y=link_y, z=link_z,
             mode='lines',
-            line=dict(color='#ff7f0e', width=3, dash='dash'),
+            line=dict(color="#ff0e0e", width=3),
             name='BS-UE Connection'
         ))
 
@@ -153,11 +153,11 @@ def visualize_simulation_plotly_3d():
 
     # Layout Customization for 3D mapping
     fig.update_layout(
-        title="Interactive 3D Downtown LA Simulation Topology",
+        title="Simulator Topology",
         scene=dict(
-            xaxis_title="X Coordinate (Meters UTM)",
-            yaxis_title="Y Coordinate (Meters UTM)",
-            zaxis_title="Z Elevation (Meters)",
+            xaxis_title="X (meters)",
+            yaxis_title="Y (meters)",
+            zaxis_title="Z (meters)",
             aspectmode='data' 
         ),
         legend=dict(x=0.02, y=0.98, bgcolor='rgba(255,255,255,0.85)', bordercolor='black', borderwidth=1),

@@ -1,6 +1,6 @@
 import numpy as np
 import geopandas as gpd
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Point
 from device_manager import DeviceManager
 from sector_manager import SectorManager
 from base_station_manager import BaseStationManager
@@ -16,6 +16,7 @@ class GeometryHelper:
         self.relative_zenith_angle_deg_matrix: np.ndarray = np.zeros((num_sectors, num_devices), dtype=np.float32)
         self.distance_matrix_meters_matrix: np.ndarray = np.zeros((num_sectors, num_devices), dtype=np.float32)
         self.is_line_of_sight_mask_matrix: np.ndarray = np.ones((num_sectors, num_devices), dtype=bool)
+        self.is_indoor_mask_vector: np.ndarray = np.zeros(num_devices, dtype=bool)
 
     def set_obstacles(self, obstacles_gdf: gpd.GeoDataFrame):
         """Load or update the GeoPandas GeoDataFrame containing GIS obstacles (e.g., buildings)."""
@@ -61,12 +62,30 @@ class GeometryHelper:
         azimuth_raw = azimuth_abs - sector_manager.sector_azimuth_angle_deg_matrix[:, np.newaxis]
         self.relative_azimuth_angle_deg_matrix = (azimuth_raw + 180) % 360 - 180
 
-        # Compute pairwise GIS-based Line-of-Sight mask matrix (M x U)
+        # Check GIS-based Indoor Mask and Pairwise Line-of-Sight Mask
+        indoor_mask = np.zeros(self.num_devices, dtype=bool)
+        lo_s_mask = np.ones((self.num_sectors, self.num_devices), dtype=bool)
+
         if self.obstacles_gdf is not None and not self.obstacles_gdf.empty:
-            lo_s_mask = np.ones((self.num_sectors, self.num_devices), dtype=bool)
-            for m in range(self.num_sectors):
-                for u in range(self.num_devices):
-                    lo_s_mask[m, u] = self.check_line_of_sight_pairwise(sector_positions[m], device_positions[u])
-            self.is_line_of_sight_mask_matrix = lo_s_mask
-        else:
-            self.is_line_of_sight_mask_matrix = np.ones((self.num_sectors, self.num_devices), dtype=bool)
+            for u in range(self.num_devices):
+                # 1. Check Indoor Mask
+                pt = Point(device_positions[u, 0], device_positions[u, 1])
+                if hasattr(self.obstacles_gdf, 'sindex'):
+                    possible_matches_index = list(self.obstacles_gdf.sindex.intersection(pt.bounds))
+                    possible_matches = self.obstacles_gdf.iloc[possible_matches_index]
+                    if possible_matches.geometry.contains(pt).any():
+                        indoor_mask[u] = True
+                else:
+                    if self.obstacles_gdf.geometry.contains(pt).any():
+                        indoor_mask[u] = True
+                
+                # 2. Check pairwise LoS
+                for m in range(self.num_sectors):
+                    # If device is indoor, it is strictly NLOS. Otherwise check the line string.
+                    if indoor_mask[u]:
+                        lo_s_mask[m, u] = False
+                    else:
+                        lo_s_mask[m, u] = self.check_line_of_sight_pairwise(sector_positions[m], device_positions[u])
+        
+        self.is_indoor_mask_vector = indoor_mask
+        self.is_line_of_sight_mask_matrix = lo_s_mask

@@ -87,13 +87,28 @@ class RadioChannelModel:
         
         pathloss_line_of_sight_matrix: np.ndarray = base_pathloss_line_of_sight_matrix_one + breakpoint_distance_mask_matrix * (18 + np.log10(geometry_helper.distance_matrix_meters_matrix) - 9 * np.log10(np.square(breakpoint_distance_matrix) + np.square(sector_positions[:, 2][:, np.newaxis] - 1 - device_positions[:, 2][np.newaxis, :] - 1))) + self.rng.normal(0, 4.4, size=(self.num_sectors, self.num_devices)).astype(np.float32)
 
-        # Use GIS-computed line-of-sight mask from GeometryHelper instead of stochastic 3GPP check
-        is_line_of_sight_mask_matrix: np.ndarray = geometry_helper.is_line_of_sight_mask_matrix
+        pathloss_nlos_matrix: np.ndarray = 13.54 + 39.08 * np.log10(geometry_helper.distance_matrix_meters_matrix) + 20 * np.log10(sector_manager.center_freq_ghz_matrix[:, np.newaxis]) - 9.5 * np.log10(np.square(breakpoint_distance_matrix) + np.square(sector_positions[:, 2][:, np.newaxis] - 1 - device_positions[:, 2][np.newaxis, :] - 1)) + self.rng.normal(0, 6, size=(self.num_sectors, self.num_devices)).astype(np.float32)
 
+        # Use GIS-computed line-of-sight mask from GeometryHelper
+        is_line_of_sight_mask_matrix: np.ndarray = geometry_helper.is_line_of_sight_mask_matrix
+        
+        # Bring in 2D indoor mask and broadcast to (num_sectors, num_devices)
+        is_indoor_mask_matrix: np.ndarray = geometry_helper.is_indoor_mask_vector[np.newaxis, :]
+
+        # 3GPP 38.901 O2I Penetration loss model
+        # Base building penetration loss + inside penetration distance loss (~20-25 dB total average)
+        # Added alongside the standard deviation for log-normal shadow fading of penetration (sigma = ~6.5)
+        o2i_penetration_loss: np.ndarray = 25.0 + self.rng.normal(0, 6.5, size=(self.num_sectors, self.num_devices)).astype(np.float32)
+
+        # Vectorized assignment: If indoor -> NLOS + O2I Loss. Else If LoS -> LoS Loss. Else -> NLOS Loss
         self.path_loss_matrix = np.where(
-            is_line_of_sight_mask_matrix,
-            pathloss_line_of_sight_matrix,
-            13.54 + 39.08 * np.log10(geometry_helper.distance_matrix_meters_matrix) + 20 * np.log10(sector_manager.center_freq_ghz_matrix[:, np.newaxis]) - 9.5 * np.log10(np.square(breakpoint_distance_matrix) + np.square(sector_positions[:, 2][:, np.newaxis] - 1 - device_positions[:, 2][np.newaxis, :] - 1)) + self.rng.normal(0, 6, size=(self.num_sectors, self.num_devices)).astype(np.float32)
+            is_indoor_mask_matrix,
+            pathloss_nlos_matrix + o2i_penetration_loss,
+            np.where(
+                is_line_of_sight_mask_matrix,
+                pathloss_line_of_sight_matrix,
+                pathloss_nlos_matrix
+            )
         ) 
 
     def update_received_power_matrix_per_resource_element(self, sector_manager: SectorManager):
