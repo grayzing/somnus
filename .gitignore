@@ -7,7 +7,7 @@ __pycache__/
 .vscode/
 # dont track sumtree
 *.dat
-
+*.csv
 # C extensions
 *.so
 */cache/
