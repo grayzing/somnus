@@ -18,7 +18,7 @@ L = 5000                  # Number of episodes to train for
 K = 64                    # Minibatch size
 M = 100                   # Number of steps per episode
 E = 0.90                  # Initial epsilon
-S = 30000                 # Experience replay buffer size
+S = 20000                 # Experience replay buffer size (~9.5 GB of memmaps at MAX_SET_SIZE=128)
 EPSILON_DECAY_FACTOR = 0.999
 MIN_EPSILON = 0.05
 GAMMA = 0.99
@@ -30,10 +30,14 @@ SECTORS_PER_BS = 3
 NUM_SLEEP_MODES = 4
 NUM_ACTIONS = SECTORS_PER_BS * NUM_SLEEP_MODES   # (which own sector) x (which sleep mode)
 NUM_NEIGHBOR_BS = 6        # own BS + 5 nearest -> 18 sectors per neighbourhood
-MAX_SET_SIZE = 96         # Max UEs per agent set (padded / truncated)
+MAX_SET_SIZE = 128        # Max UEs per agent set; ~8 % of agent-steps exceed it, the least-backlogged UEs are dropped
 SLA_MBPS = 8.0
-MAX_COUNTDOWN = 15.0      # longest sleep-mode lock in SleepModeManager (5 + 10 steps)
-ALPHA, BETA = 1.0, 1.7    # Reward weights (energy, SLA)
+MAX_COUNTDOWN = 15.0      # longest sleep-mode lock in SleepModeManager (5 wake + 10 dwell steps)
+CONTROL_INTERVAL_MS = 10  # one agent decision every 10 simulator steps (1 ms each) -> episode = M*10 ms
+SIM_LENGTH_MS = M * CONTROL_INTERVAL_MS
+TOPOLOGY_SEED = 0         # fixed network for every run / ablation arm
+# Reward = REWARD_SCALE * (ALPHA * energy_saving + BETA * sla_satisfaction), both in [0, 1]
+ALPHA, BETA, REWARD_SCALE = 1.0, 1.7, 6.0
 
 assert K >= 2, "Minibatch size must be greater than 1"
 
@@ -73,12 +77,14 @@ def build_neighborhoods(simulator: Simulator) -> np.ndarray:
 # ----------------------------------------------------------------------------
 # Observation / state / reward construction
 # ----------------------------------------------------------------------------
-def build_observations(simulator: Simulator, nbrs: np.ndarray, elapsed_ms: int, t_idx: int) -> dict:
+def build_observations(simulator: Simulator, nbrs: np.ndarray, t_idx: int) -> dict:
     """
     For ALL agents at once:
       feats  (A, MAX_SET_SIZE, F)  per-UE KPI vectors
       counts (A,)                  number of valid UEs (rest is padding)
-      ctx    (A, 7N+1)             per neighbour sector: sleep one-hot(4), countdown, PRB util, UE count; + time
+      ctx    (A, 7N+1)             per neighbour sector: sleep one-hot(4), lock remaining, PRB util, UE count; + time
+    t_idx is the decision-step index within the episode (0..M).  Per-UE rate / SLA flags come from the
+    previous control interval's window (zeros / satisfied at episode start), backlog from the live queue.
       state  (S*10+1,)             global per-sector summary for the mixer
 
     A UE is in agent a's set if its SERVING sector or its STRONGEST sector (ignoring sleep) lies in
@@ -87,28 +93,25 @@ def build_observations(simulator: Simulator, nbrs: np.ndarray, elapsed_ms: int, 
     """
     rcm = simulator.radio_channel_model
     rx = rcm.received_power_dbm_matrix_per_resource_element
-    snr = rcm.snr_dbm_matrix_per_slot
-    se = rcm.spectral_efficiency_matrix
     num_sectors, num_devices = rx.shape
     A, N = nbrs.shape
     dev = np.arange(num_devices)
 
     sleep = np.asarray(simulator.sleep_mode_manager.sector_sleep_mode_matrix).astype(np.int64)
-    countdown = np.asarray(simulator.sleep_mode_manager.sector_sleep_mode_countdown, dtype=np.float32) / MAX_COUNTDOWN
+    countdown = np.minimum(simulator.sleep_mode_manager.lock_remaining() / MAX_COUNTDOWN, 1.0).astype(np.float32)
     util = np.asarray(simulator.sector_manager.sector_physical_resource_block_utilization, dtype=np.float32)
 
     serving = simulator.handover_manager.get_serving_sector_indices()   # actual (awake) serving sector
     best = np.argmax(rx, axis=0)                                        # strongest sector, sleeping or not
 
-    ue_rx, ue_snr, ue_se = rx[serving, dev], snr[serving, dev], se[serving, dev]
+    ue_rx, ue_snr, ue_se = rx[serving, dev], rcm.serving_sinr_db, rcm.serving_spectral_efficiency
     gap = np.clip((rx[best, dev] - ue_rx) / 30.0, 0.0, 3.0)             # RSRP lost by not using the best sector
 
-    tput = np.asarray(simulator.kpi_handler.calculate_throughput_mbps(elapsed_ms))
-    tput_norm = np.minimum(tput / SLA_MBPS, 2.0)
-    sla_ok = (tput >= SLA_MBPS).astype(np.float32)
-
-    tg = simulator.traffic_generator
-    demand = np.clip(tg.device_downlink_bits_matrix[:, t_idx] / max(getattr(tg, "high_rate", 1.0), 1.0), 0.0, 1.0)
+    kh = simulator.kpi_handler
+    tput_norm = np.minimum(kh.last_window_rate_mbps.astype(np.float64) / SLA_MBPS, 2.0)   # last interval's rate
+    sla_ok = kh.last_window_satisfied.astype(np.float32)                                   # 1 for idle UEs
+    backlog = simulator.traffic_generator.backlog_bits
+    demand = np.clip(np.log1p(backlog / 1e3) / 8.0, 0.0, 1.5)                              # queued bits, log-scaled
 
     base = np.column_stack([
         (ue_rx + 120.0) / 30.0, ue_snr / 35.0, ue_se / 7.4,
@@ -122,7 +125,7 @@ def build_observations(simulator: Simulator, nbrs: np.ndarray, elapsed_ms: int, 
     ctx = np.zeros((A, 7 * N + 1), dtype=np.float32)
     eye_ext = np.vstack([np.eye(N, dtype=np.float32), np.zeros((1, N), dtype=np.float32)])  # row N = "not in neighbourhood"
     local = np.full(num_sectors, -1, dtype=np.int64)
-    time_feat = t_idx / float(simulator.simulation_length_ms)
+    time_feat = t_idx / float(M)
 
     for a in range(A):
         local[:] = -1
@@ -131,8 +134,8 @@ def build_observations(simulator: Simulator, nbrs: np.ndarray, elapsed_ms: int, 
         members = np.flatnonzero((sl >= 0) | (bl >= 0))
         per_sector_counts = np.bincount(sl[sl >= 0], minlength=N)
 
-        if len(members) > MAX_SET_SIZE:                                 # keep the UEs in the worst shape
-            members = members[np.argsort(tput[members])[:MAX_SET_SIZE]]
+        if len(members) > MAX_SET_SIZE:                                 # keep the most backlogged UEs
+            members = members[np.argsort(-backlog[members])[:MAX_SET_SIZE]]
         n = len(members)
         s_m, b_m = sl[members], bl[members]
 
@@ -168,26 +171,13 @@ def build_observations(simulator: Simulator, nbrs: np.ndarray, elapsed_ms: int, 
     return {"feats": feats, "counts": counts, "ctx": ctx, "state": state}
 
 
-def team_reward(simulator: Simulator, elapsed_ms: int) -> float:
-    """Single shared team reward (QMIX/VDN learn from one team reward, not one per agent)."""
-    sleep = np.asarray(simulator.sleep_mode_manager.sector_sleep_mode_matrix)
-    tput = np.asarray(simulator.kpi_handler.calculate_throughput_mbps(elapsed_ms))
-    r_sleep = ALPHA * (
-        -3 * np.mean(sleep == 0) + 1 * np.mean(sleep == 1)
-        + 3 * np.mean(sleep == 2) + 6 * np.mean(sleep == 3)
-    )
-    r_sla = BETA * 6 * np.mean(tput >= SLA_MBPS)
-    return float(r_sleep + r_sla)
-
-
-def warm_start(simulator: Simulator):
+def team_reward(kpis: dict) -> float:
     """
-    reset() zeroes the radio/geometry/association matrices, so before the first step every UE would look
-    like it is served by sector 0 with zero power. Run one step to populate them, then discard the KPIs
-    that step accumulated so the episode's throughput starts from zero.
+    Single shared team reward from the interval KPIs of Simulator.pop_interval_kpis():
+      energy_saving   = 1 - avg_power / power(all sectors active at full load)      (from the RU power model)
+      sla_satisfaction = fraction of UEs with demand that got >= 95 % of it or >= SLA_MBPS
     """
-    simulator.step(0)
-    simulator.kpi_handler.total_transmitted_bits_per_device[:] = 0.0
+    return float(REWARD_SCALE * (ALPHA * kpis["energy_saving"] + BETA * kpis["sla_satisfaction"]))
 
 
 # ----------------------------------------------------------------------------
@@ -316,15 +306,14 @@ def polyak_update(target, online):
 # ----------------------------------------------------------------------------
 # Training (shared by QMIX and VDN)
 # ----------------------------------------------------------------------------
-def train(mixer_type: str = "qmix", dueling: bool = True):
+def train(mixer_type: str = "qmix", dueling: bool = True, seed: int = None):
     assert mixer_type in ("qmix", "vdn", "iql"), "mixer_type must be 'qmix', 'vdn' or 'iql'"
     run_name = mixer_type + ("" if dueling else "_nodueling")   # keeps ablation outputs separate
-    initial_seed = int(time.time())
-    simulator = Simulator(19, 200, M, seed=initial_seed)
+    initial_seed = int(time.time()) if seed is None else int(seed)
+    simulator = Simulator(19, 200, SIM_LENGTH_MS, seed=initial_seed, topology_seed=TOPOLOGY_SEED)
     nbrs = build_neighborhoods(simulator)
-    warm_start(simulator)
 
-    obs = build_observations(simulator, nbrs, 0, 0)
+    obs = build_observations(simulator, nbrs, 0)
     A, _, F = obs["feats"].shape
     C = obs["ctx"].shape[1]
     SD = obs["state"].shape[0]
@@ -348,7 +337,7 @@ def train(mixer_type: str = "qmix", dueling: bool = True):
     }
     memory = Memory(S, specs, f"../sumtree_{run_name}", np.random.default_rng(initial_seed))
 
-    kpi_list, columns = [], ['episode', 'loss', 'reward', 'epsilon']
+    kpi_list, columns = [], ['episode', 'loss', 'reward', 'epsilon', 'energy_saving', 'sla_satisfaction', 'avg_power_w']
     epsilon = E
 
     for episode in range(1, L + 1):
@@ -361,12 +350,14 @@ def train(mixer_type: str = "qmix", dueling: bool = True):
                 sleep_mode_id = int(actions[agent] % NUM_SLEEP_MODES)
                 simulator.sleep_mode_manager.set_sleep_mode(sector_id, sleep_mode_id, simulator.sector_manager)
 
-            simulator.step(step)
+            for k in range(CONTROL_INTERVAL_MS):
+                simulator.step(step * CONTROL_INTERVAL_MS + k)
 
             # ---- observe ----
-            # Observation for step s+1 == next observation of step s (reused below).
-            next_obs = build_observations(simulator, nbrs, step + 1, min(step + 1, M - 1))
-            reward = team_reward(simulator, step + 1)
+            # Observation for decision s+1 == next observation of decision s (reused below).
+            kpis = simulator.pop_interval_kpis(SLA_MBPS)
+            next_obs = build_observations(simulator, nbrs, step + 1)
+            reward = team_reward(kpis)
             done = float(step == M - 1)
 
             memory.add(error=1e2, sample={
@@ -423,14 +414,13 @@ def train(mixer_type: str = "qmix", dueling: bool = True):
                 polyak_update(target_q_net, q_net)
                 polyak_update(target_mixer, mixer)
 
-                kpi_list.append((episode, loss.item(), reward, epsilon))
+                kpi_list.append((episode, loss.item(), reward, epsilon, kpis['energy_saving'], kpis['sla_satisfaction'], kpis['avg_power_w']))
 
         print("Ended episode!")
         epsilon = max(epsilon * EPSILON_DECAY_FACTOR, MIN_EPSILON)
         print(f"Restarting simulator with seed {initial_seed + episode}")
-        simulator.reset(initial_seed + episode)
-        warm_start(simulator)
-        obs = build_observations(simulator, nbrs, 0, 0)
+        simulator.reset(initial_seed + episode)      # also refreshes geometry/channel/association
+        obs = build_observations(simulator, nbrs, 0)
 
         if episode % 20 == 0:
             try:
@@ -462,5 +452,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("algo", nargs="?", default="qmix", choices=["qmix", "vdn", "iql"])
     parser.add_argument("--no-dueling", action="store_true", help="ablation: plain Q-head instead of dueling")
+    parser.add_argument("--seed", type=int, default=None, help="fix the episode seed stream (default: time based)")
     args = parser.parse_args()
-    train(args.algo, dueling=not args.no_dueling)
+    train(args.algo, dueling=not args.no_dueling, seed=args.seed)

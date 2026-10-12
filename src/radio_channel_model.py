@@ -1,3 +1,4 @@
+import warnings
 import numpy as np
 
 from base_station_manager import BaseStationManager
@@ -6,20 +7,33 @@ from device_manager import DeviceManager
 from geometry_helper import GeometryHelper
 from sleep_mode_manager import SleepModeManager
 
-from scipy.spatial.distance import cdist
+
+SINR_THRESHOLDS_DB = np.array([-6.0, -4.0, -2.0, 1.0, 3.0, 5.5, 8.0, 11.0, 13.0, 16.0, 18.0, 21.0, 23.0, 26.0, 29.0])
+SPECTRAL_EFFICIENCIES = np.array([
+    0.0000, 0.1523, 0.3770, 0.8770, 1.4766, 1.9141, 2.4063,
+    2.7305, 3.3223, 3.9023, 4.5234, 5.1152, 5.5547, 6.2266, 6.9141, 7.4063
+])
+
 
 class RadioChannelModel:
-    def __init__(self, num_sectors: int, num_devices: int, seed=24) -> None:
+    """
+    Link model following 3GPP TR 38.901 UMa:
+      * LoS: PL1 for d2D <= d_BP', PL2 beyond (d_BP' = 4 (h_BS-1)(h_UT-1) fc / c), sigma_SF = 4 dB
+      * NLoS: max(PL_LoS, PL'_NLoS), sigma_SF = 6 dB;  indoor UEs: NLoS + O2I penetration loss
+      * Shadow fading is spatially correlated over time (AR(1) in UE displacement, d_corr = 37 m) instead of
+        being redrawn i.i.d. every step; O2I loss is drawn once per UE.
+      * `snr_dbm_matrix_per_slot` holds the per-resource-element SINR in dB (name kept for compatibility):
+        S_RE / (N_RE + I_RE) where N_RE is the thermal noise in ONE subcarrier and I_RE is co-channel
+        interference from other AWAKE sectors on the same carrier, weighted by their PRB utilisation.
+    """
+    SHADOW_DECORRELATION_M = 37.0
+    NOISE_FIGURE_DB = 9.0
+    SINR_CAP_DB = 35.0
+
+    def __init__(self, num_sectors: int, num_devices: int, seed=24, interference: bool = True) -> None:
         self.num_sectors = num_sectors
         self.num_devices = num_devices
-
-        self.path_loss_matrix: np.ndarray = np.zeros((num_sectors, num_devices), dtype=np.float32)
-        self.directional_gain_matrix: np.ndarray = np.zeros((num_sectors, num_devices), dtype=np.float32)
-        self.received_power_dbm_matrix_per_resource_element: np.ndarray = np.zeros((num_sectors, num_devices), dtype=np.float32)
-        self.snr_dbm_matrix_per_slot: np.ndarray = np.zeros((num_sectors, num_devices), dtype=np.float32)
-        self.spectral_efficiency_matrix: np.ndarray = np.zeros((num_sectors, num_devices), dtype=np.float32)
-
-        self.rng = np.random.default_rng(seed)
+        self.interference = interference
 
         self._3gpp_prb_table = {
             'FR1': {
@@ -32,100 +46,196 @@ class RadioChannelModel:
                 120: {50: 32, 100: 66,  200: 132, 400: 264}
             }
         }
+        self.reset(seed)
 
+    # ------------------------------------------------------------------ state
+    def reset(self, seed=None) -> None:
+        """Zero all link matrices and restart the shadowing process (optionally reseeding)."""
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+        shape = (self.num_sectors, self.num_devices)
+        self.path_loss_matrix = np.zeros(shape, dtype=np.float32)
+        self.directional_gain_matrix = np.zeros(shape, dtype=np.float32)
+        self.received_power_dbm_matrix_per_resource_element = np.zeros(shape, dtype=np.float32)
+        self.snr_dbm_matrix_per_slot = np.zeros(shape, dtype=np.float32)
+        self.interference_dbm_matrix_per_resource_element = np.full(shape, -np.inf, dtype=np.float32)
+        self.spectral_efficiency_matrix = np.zeros(shape, dtype=np.float32)
+        # Serving-link quantities (what the scheduler / observations actually consume), shape (U,)
+        self.serving_sinr_db = np.zeros(self.num_devices, dtype=np.float32)
+        self.serving_spectral_efficiency = np.zeros(self.num_devices, dtype=np.float32)
+        self._rx_mw = None
+        self._ue_index = np.arange(self.num_devices)
+        self._carrier_key = None
+        self._same_carrier = None
+        self._noise_key = None
+        self._noise_re_mw = None
+        self._shadow_z = None
+        self._o2i_z = None
+        self._last_ue_xy = None
+        self._prb_cache_key = None
+        self._prb_cache = None
+
+    # ------------------------------------------------------------------ PRBs
     def _get_3gpp_prbs(self, center_freq_ghz: float, numerology: int, bandwidth_mhz: float) -> int:
         fr = 'FR2' if center_freq_ghz > 24.0 else 'FR1'
-        scs = 15 * (2 ** numerology)
-        bw = int(round(bandwidth_mhz))
-        
+        scs = 15 * (2 ** int(numerology))
+        bw = int(round(float(bandwidth_mhz)))
         try:
             return self._3gpp_prb_table[fr][scs][bw]
         except KeyError:
-            import warnings
             fallback_prb = int(bandwidth_mhz * 5)
-            warnings.warn(f"Config combination (FR: {fr}, SCS: {scs}kHz, BW: {bw}MHz) not found in 3GPP spec tables. Falling back to linear calculation ({fallback_prb} PRBs).")
+            warnings.warn(f"Config combination (FR: {fr}, SCS: {scs}kHz, BW: {bw}MHz) not found in 3GPP spec tables. "
+                          f"Falling back to linear calculation ({fallback_prb} PRBs).")
             return fallback_prb
 
-    def update_spectral_efficiency_matrix(self, sleep_mode_manager: SleepModeManager) -> None:
-        snr_thresholds = np.array([-6.0, -4.0, -2.0, 1.0, 3.0, 5.5, 8.0, 11.0, 13.0, 16.0, 18.0, 21.0, 23.0, 26.0, 29.0])
-        spectral_efficiencies = np.array([
-            0.0000, 0.1523, 0.3770, 0.8770, 1.4766, 1.9141, 2.4063, 
-            2.7305, 3.3223, 3.9023, 4.5234, 5.1152, 5.5547, 6.2266, 6.9141, 7.4063
-        ])
-        cqi_matrix = np.digitize(self.snr_dbm_matrix_per_slot, snr_thresholds)
-        allocated_spectral_efficiency = spectral_efficiencies[cqi_matrix]
-        self.spectral_efficiency_matrix = allocated_spectral_efficiency
-        sleeping_indices = sleep_mode_manager.get_sector_sleep_mode_indices()
-        if len(sleeping_indices) > 0:
-            self.spectral_efficiency_matrix[sleeping_indices, :] = 0.0
+    def get_prbs_per_sector(self, sector_manager: SectorManager) -> np.ndarray:
+        """Number of PRBs per sector (cached; recomputed only if the sector configuration changes)."""
+        key = (sector_manager.center_freq_ghz_matrix.tobytes(),
+               sector_manager.sector_numerology_matrix.tobytes(),
+               sector_manager.bandwidth_mhz_matrix.tobytes())
+        if key != self._prb_cache_key:
+            self._prb_cache = np.array([
+                self._get_3gpp_prbs(sector_manager.center_freq_ghz_matrix[i],
+                                    sector_manager.sector_numerology_matrix[i],
+                                    sector_manager.bandwidth_mhz_matrix[i])
+                for i in range(self.num_sectors)], dtype=np.float32)
+            self._prb_cache_key = key
+        return self._prb_cache
 
+    # ------------------------------------------------------------------ SE
+    def update_spectral_efficiency_matrix(self, sleep_mode_manager: SleepModeManager) -> None:
+        cqi_matrix = np.digitize(self.snr_dbm_matrix_per_slot, SINR_THRESHOLDS_DB)
+        se = SPECTRAL_EFFICIENCIES[cqi_matrix].astype(np.float32)
+        sleeping = np.asarray(sleep_mode_manager.sector_sleep_mode_matrix) > 0
+        se[sleeping, :] = 0.0
+        self.spectral_efficiency_matrix = se
+
+    # ------------------------------------------------------------------ antenna
     def update_directional_gain_matrix(self, geometry_helper: GeometryHelper, sector_manager: SectorManager, device_manager: DeviceManager):
-        vertical_attenuation_db: np.ndarray = np.minimum(
-            12*np.square(geometry_helper.relative_zenith_angle_deg_matrix / sector_manager.vertical_beamwidth_deg_matrix[:, np.newaxis]),
+        vertical_attenuation_db = np.minimum(
+            12 * np.square(geometry_helper.relative_zenith_angle_deg_matrix / sector_manager.vertical_beamwidth_deg_matrix[:, np.newaxis]),
             30
         )
-
-        horizontal_attenuation_db: np.ndarray = np.minimum(
-            12*np.square(geometry_helper.relative_azimuth_angle_deg_matrix / sector_manager.horizontal_beamwidth_deg_matrix[:, np.newaxis]),
+        horizontal_attenuation_db = np.minimum(
+            12 * np.square(geometry_helper.relative_azimuth_angle_deg_matrix / sector_manager.horizontal_beamwidth_deg_matrix[:, np.newaxis]),
             sector_manager.front_to_back_ratio_matrix[:, np.newaxis]
         )
-
-        self.directional_gain_matrix = -1 * np.minimum(
+        self.directional_gain_matrix = (-1 * np.minimum(
             vertical_attenuation_db + horizontal_attenuation_db,
             sector_manager.front_to_back_ratio_matrix[:, np.newaxis]
-        )
+        )).astype(np.float32)
 
+    # ------------------------------------------------------------------ shadowing
+    def _update_shadow_state(self, ue_xy: np.ndarray) -> None:
+        shape = (self.num_sectors, self.num_devices)
+        if self._shadow_z is None or self._shadow_z.shape != shape:
+            self._shadow_z = self.rng.standard_normal(shape)
+            self._o2i_z = self.rng.standard_normal(self.num_devices)
+        elif self._last_ue_xy is not None:
+            disp = np.linalg.norm(ue_xy - self._last_ue_xy, axis=1)
+            rho = np.exp(-disp / self.SHADOW_DECORRELATION_M)[np.newaxis, :]
+            self._shadow_z = rho * self._shadow_z + np.sqrt(1.0 - rho ** 2) * self.rng.standard_normal(shape)
+        self._last_ue_xy = ue_xy.copy()
+
+    # ------------------------------------------------------------------ path loss
     def update_path_loss_matrix(self, geometry_helper: GeometryHelper, sector_manager: SectorManager, base_station_manager: BaseStationManager, device_manager: DeviceManager):
-        device_positions: np.ndarray = device_manager.get_all_positions() # U x 3
-        sector_positions: np.ndarray = base_station_manager.get_all_positions()[sector_manager.sector_parent_base_station_vector] # M x 3
-        
-        breakpoint_distance_matrix: np.ndarray = 4 * device_positions[:, 2][np.newaxis, :] * sector_positions[:, 2][:, np.newaxis] * sector_manager.center_freq_ghz_matrix[:, np.newaxis].astype(np.float32) * 1e9 / 3e8
+        ue_pos = device_manager.get_all_positions().astype(np.float64)                    # U x 3
+        sec_pos = base_station_manager.get_all_positions()[
+            sector_manager.sector_parent_base_station_vector].astype(np.float64)          # M x 3
+        h_bs = sec_pos[:, 2][:, None]
+        h_ue = ue_pos[:, 2][None, :]
 
-        breakpoint_distance_mask_matrix: np.ndarray = (10 <= geometry_helper.distance_matrix_meters_matrix) & (geometry_helper.distance_matrix_meters_matrix < breakpoint_distance_matrix)
+        d3 = np.maximum(geometry_helper.distance_matrix_meters_matrix.astype(np.float64), 1.0)
+        dz = h_bs - h_ue
+        d2 = np.sqrt(np.maximum(d3 ** 2 - dz ** 2, 0.0))
+        d3 = np.maximum(d3, 10.0)                                                         # model validity: d >= 10 m
+        fc = sector_manager.center_freq_ghz_matrix.astype(np.float64)[:, None]
 
-        base_pathloss_line_of_sight_matrix_one: np.ndarray = 28.0 + 22 * np.log10(geometry_helper.distance_matrix_meters_matrix) + 20 * np.log10(sector_manager.center_freq_ghz_matrix[:, np.newaxis])
-        
-        pathloss_line_of_sight_matrix: np.ndarray = base_pathloss_line_of_sight_matrix_one + breakpoint_distance_mask_matrix * (18 + np.log10(geometry_helper.distance_matrix_meters_matrix) - 9 * np.log10(np.square(breakpoint_distance_matrix) + np.square(sector_positions[:, 2][:, np.newaxis] - 1 - device_positions[:, 2][np.newaxis, :] - 1))) + self.rng.normal(0, 4.4, size=(self.num_sectors, self.num_devices)).astype(np.float32)
+        # Breakpoint uses effective heights h' = h - 1 m (38.901 Table 7.4.1-1, note 1)
+        d_bp = 4.0 * np.maximum(h_bs - 1.0, 0.1) * np.maximum(h_ue - 1.0, 0.1) * fc * 1e9 / 3e8
 
-        pathloss_nlos_matrix: np.ndarray = 13.54 + 39.08 * np.log10(geometry_helper.distance_matrix_meters_matrix) + 20 * np.log10(sector_manager.center_freq_ghz_matrix[:, np.newaxis]) - 9.5 * np.log10(np.square(breakpoint_distance_matrix) + np.square(sector_positions[:, 2][:, np.newaxis] - 1 - device_positions[:, 2][np.newaxis, :] - 1)) + self.rng.normal(0, 6, size=(self.num_sectors, self.num_devices)).astype(np.float32)
+        pl1 = 28.0 + 22.0 * np.log10(d3) + 20.0 * np.log10(fc)
+        pl2 = 28.0 + 40.0 * np.log10(d3) + 20.0 * np.log10(fc) - 9.0 * np.log10(d_bp ** 2 + dz ** 2)
+        pl_los = np.where(d2 <= d_bp, pl1, pl2)
+        pl_nlos_prime = 13.54 + 39.08 * np.log10(d3) + 20.0 * np.log10(fc) - 0.6 * (h_ue - 1.5)
+        pl_nlos = np.maximum(pl_los, pl_nlos_prime)
 
-        # Use GIS-computed line-of-sight mask from GeometryHelper
-        is_line_of_sight_mask_matrix: np.ndarray = geometry_helper.is_line_of_sight_mask_matrix
-        
-        # Bring in 2D indoor mask and broadcast to (num_sectors, num_devices)
-        is_indoor_mask_matrix: np.ndarray = geometry_helper.is_indoor_mask_vector[np.newaxis, :]
+        los = geometry_helper.is_line_of_sight_mask_matrix
+        indoor = geometry_helper.is_indoor_mask_vector[np.newaxis, :]
+        use_los = los & ~indoor
 
-        # 3GPP 38.901 O2I Penetration loss model
-        # Base building penetration loss + inside penetration distance loss (~20-25 dB total average)
-        # Added alongside the standard deviation for log-normal shadow fading of penetration (sigma = ~6.5)
-        o2i_penetration_loss: np.ndarray = 25.0 + self.rng.normal(0, 6.5, size=(self.num_sectors, self.num_devices)).astype(np.float32)
+        self._update_shadow_state(ue_pos[:, :2])
+        sigma = np.where(use_los, 4.0, 6.0)
+        o2i = np.where(indoor, 25.0 + 6.5 * self._o2i_z[np.newaxis, :], 0.0)
 
-        # Vectorized assignment: If indoor -> NLOS + O2I Loss. Else If LoS -> LoS Loss. Else -> NLOS Loss
-        self.path_loss_matrix = np.where(
-            is_indoor_mask_matrix,
-            pathloss_nlos_matrix + o2i_penetration_loss,
-            np.where(
-                is_line_of_sight_mask_matrix,
-                pathloss_line_of_sight_matrix,
-                pathloss_nlos_matrix
-            )
-        ) 
+        self.path_loss_matrix = (np.where(use_los, pl_los, pl_nlos) + sigma * self._shadow_z + o2i).astype(np.float32)
 
+    # ------------------------------------------------------------------ power / SINR
     def update_received_power_matrix_per_resource_element(self, sector_manager: SectorManager):
-        num_subcarriers = np.zeros((self.num_sectors, 1), dtype=np.float32)
-        for sector_idx in range(self.num_sectors):
-            num_subcarriers[sector_idx] = 10*np.log10(12 * self._get_3gpp_prbs(sector_manager.center_freq_ghz_matrix[sector_idx], sector_manager.sector_numerology_matrix[sector_idx], sector_manager.bandwidth_mhz_matrix[sector_idx]))
-        self.received_power_dbm_matrix_per_resource_element = sector_manager.tx_power_dbm_matrix[:, np.newaxis] - self.path_loss_matrix + self.directional_gain_matrix - num_subcarriers
+        num_subcarriers_db = 10 * np.log10(12.0 * self.get_prbs_per_sector(sector_manager))[:, np.newaxis]
+        self.received_power_dbm_matrix_per_resource_element = (
+            sector_manager.tx_power_dbm_matrix[:, np.newaxis] - self.path_loss_matrix
+            + self.directional_gain_matrix - num_subcarriers_db
+        ).astype(np.float32)
+        self._rx_mw = 10 ** (self.received_power_dbm_matrix_per_resource_element.astype(np.float64) / 10)
 
-    def update_snr_dbm_matrix_per_slot(self, sector_manager: SectorManager):
-        bandwidth_hz = sector_manager.bandwidth_mhz_matrix[:, np.newaxis] * 1e6
-        thermal_noise_dbm = -174.0 + 10 * np.log10(bandwidth_hz) + 9.0  # Noise Figure = 9
-        thermal_noise_mw = 10 ** (thermal_noise_dbm / 10)
+    def update_serving_link(self, serving: np.ndarray, sector_manager: SectorManager,
+                            sleep_mode_manager: SleepModeManager = None) -> None:
+        """
+        Per-UE SINR and spectral efficiency on the SERVING link only (O(U*M) instead of O(M*M*U)).
+        Same model as update_snr_dbm_matrix_per_slot + update_spectral_efficiency_matrix, but nothing
+        outside the serving entries is ever read by the scheduler or the observations.
+        """
+        if self._rx_mw is None:
+            self._rx_mw = 10 ** (self.received_power_dbm_matrix_per_resource_element.astype(np.float64) / 10)
+        ue = self._ue_index
+        signal_mw = self._rx_mw[serving, ue]
 
-        noise_denominator_mw = thermal_noise_mw
-        noise_denominator_dbm = 10 * np.log10(noise_denominator_mw)
+        noise_key = sector_manager.sector_numerology_matrix.tobytes()
+        if noise_key != self._noise_key:
+            scs_hz = 15e3 * (2.0 ** sector_manager.sector_numerology_matrix.astype(np.float64))
+            self._noise_re_mw = 10 ** ((-174.0 + 10 * np.log10(scs_hz) + self.NOISE_FIGURE_DB) / 10)
+            self._noise_key = noise_key
+        denom = self._noise_re_mw[serving]
 
-        self.snr_dbm_matrix_per_slot = np.minimum(
-            35.0,
-            self.received_power_dbm_matrix_per_resource_element - noise_denominator_dbm,
-        )
+        sleeping = None
+        if sleep_mode_manager is not None:
+            sleeping = np.asarray(sleep_mode_manager.sector_sleep_mode_matrix) > 0
+        if self.interference:
+            carrier_key = sector_manager.center_freq_ghz_matrix.tobytes()
+            if carrier_key != self._carrier_key:
+                f = sector_manager.center_freq_ghz_matrix
+                self._same_carrier = ((f[:, None] == f[None, :]) & ~np.eye(self.num_sectors, dtype=bool)).astype(np.float64)
+                self._carrier_key = carrier_key
+            load = np.clip(np.asarray(sector_manager.sector_physical_resource_block_utilization, dtype=np.float64), 0.0, 1.0)
+            active_load = load if sleeping is None else load * ~sleeping
+            weights = self._same_carrier[serving] * active_load[None, :]                 # (U, M)
+            denom = denom + np.einsum('um,mu->u', weights, self._rx_mw)
+
+        sinr_db = np.minimum(self.SINR_CAP_DB, 10 * np.log10(signal_mw / denom))
+        se = SPECTRAL_EFFICIENCIES[np.searchsorted(SINR_THRESHOLDS_DB, sinr_db, side='right')]
+        if sleeping is not None:
+            se = np.where(sleeping[serving], 0.0, se)
+        self.serving_sinr_db = sinr_db.astype(np.float32)
+        self.serving_spectral_efficiency = se.astype(np.float32)
+
+    def update_snr_dbm_matrix_per_slot(self, sector_manager: SectorManager, sleep_mode_manager: SleepModeManager = None):
+        """Per-RE SINR (dB). Sleeping sectors neither serve nor interfere."""
+        scs_hz = 15e3 * (2.0 ** sector_manager.sector_numerology_matrix.astype(np.float64))
+        noise_re_mw = 10 ** ((-174.0 + 10 * np.log10(scs_hz) + self.NOISE_FIGURE_DB) / 10)[:, np.newaxis]
+
+        p_mw = 10 ** (self.received_power_dbm_matrix_per_resource_element.astype(np.float64) / 10)
+        interference_mw = np.zeros_like(p_mw)
+        if self.interference:
+            awake = np.ones(self.num_sectors) if sleep_mode_manager is None else \
+                (np.asarray(sleep_mode_manager.sector_sleep_mode_matrix) == 0).astype(np.float64)
+            load = np.clip(np.asarray(sector_manager.sector_physical_resource_block_utilization, dtype=np.float64), 0.0, 1.0)
+            freq = sector_manager.center_freq_ghz_matrix
+            same_carrier = (freq[:, None] == freq[None, :]) & ~np.eye(self.num_sectors, dtype=bool)
+            weights = same_carrier * (awake * load)[None, :]                    # (victim i, interferer j)
+            interference_mw = weights @ p_mw                                    # (M, U)
+
+        with np.errstate(divide='ignore'):
+            self.interference_dbm_matrix_per_resource_element = (10 * np.log10(interference_mw)).astype(np.float32)
+        sinr_db = 10 * np.log10(p_mw / (noise_re_mw + interference_mw))
+        self.snr_dbm_matrix_per_slot = np.minimum(self.SINR_CAP_DB, sinr_db).astype(np.float32)

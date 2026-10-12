@@ -8,8 +8,8 @@ from simulator import Simulator
 
 def visualize_simulation_plotly_3d():
     print("Initializing simulator and fetching Downtown LA geometry...")
-    num_base_stations = 7
-    num_devices = 40
+    num_base_stations = 19
+    num_devices = 200
     sim = Simulator(num_base_stations=num_base_stations, num_devices=num_devices)
     
     # Reset and run a few steps to populate positions, channels, and associations
