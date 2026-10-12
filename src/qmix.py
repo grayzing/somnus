@@ -16,7 +16,7 @@ from q_network import DeepSetQ, QMixer, VDNMixer
 # ----------------------------------------------------------------------------
 L = 5000                  # Number of episodes to train for
 K = 64                    # Minibatch size
-M = 100                   # Number of steps per episode
+M = 60000                   # Number of steps per episode
 E = 0.90                  # Initial epsilon
 S = 20000                 # Experience replay buffer size (~9.5 GB of memmaps at MAX_SET_SIZE=128)
 EPSILON_DECAY_FACTOR = 0.999

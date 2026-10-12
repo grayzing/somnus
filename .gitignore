@@ -9,6 +9,7 @@ __pycache__/
 *.dat
 *.csv
 *.pkl
+*.pth
 # C extensions
 *.so
 */cache/
